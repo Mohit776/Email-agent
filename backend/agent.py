@@ -20,6 +20,7 @@ from agno.tools.mcp import MCPTools
 
 from config import GROQ_API_KEY, KEYWORDS, LINKEDIN_MCP_URL, MAX_PROFILES_PER_KEYWORD
 from models import KeywordSearchResult, ProfileResult, SearchResponse
+from brief_agent import parse_profile_with_llm
 
 logger = logging.getLogger(__name__)
 
@@ -200,71 +201,67 @@ async def search_profiles_for_keyword(
         try:
             logger.info(f"  📋 Enriching profile: {username}")
             profile_text = ""
+
+            # Call MCP tool directly (skip Agno agent — it loses raw data)
             try:
-                profile_response = await agent.arun(
-                    f'Get the LinkedIn profile for username "{username}". Call get_person_profile with linkedin_username="{username}", sections="contact_info". Then briefly describe what you found.'
-                )
-
-                if hasattr(profile_response, 'content') and profile_response.content:
-                    profile_text = profile_response.content if isinstance(profile_response.content, str) else str(profile_response.content)
-
-                if hasattr(profile_response, 'messages') and profile_response.messages:
-                    for msg in profile_response.messages:
-                        if hasattr(msg, 'content') and msg.content:
-                            msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                            if len(msg_content) > len(profile_text):
-                                profile_text = msg_content
-                        if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                if hasattr(tc, 'result') and tc.result is not None:
-                                    if isinstance(tc.result, dict):
-                                        sections = tc.result.get("sections", {})
-                                        combined = sections.get("main_profile", "") + "\n" + sections.get("contact_info", "")
-                                        if len(combined) > len(profile_text):
-                                            profile_text = combined
-                                    elif isinstance(tc.result, str):
-                                        try:
-                                            parsed = json.loads(tc.result)
-                                            sections = parsed.get("sections", {})
-                                            combined = sections.get("main_profile", "") + "\n" + sections.get("contact_info", "")
-                                            if len(combined) > len(profile_text):
-                                                profile_text = combined
-                                        except Exception:
-                                            if len(tc.result) > len(profile_text):
-                                                profile_text = tc.result
-                                    else:
-                                        tc_str = str(tc.result)
-                                        if len(tc_str) > len(profile_text):
-                                            profile_text = tc_str
-            except Exception as e:
-                logger.warning(f"  ⚠️ Agent profile enrichment failed, attempting direct MCP fallback: {e}")
                 raw_result = await mcp_tools.session.call_tool(
-                    "get_person_profile", 
-                    {"linkedin_username": username, "sections": "contact_info"}
+                    "get_person_profile",
+                    {"linkedin_username": username, "sections": "contact_info,experience,skills"},
                 )
+
+                # Extract text from all sections in the MCP response
                 if isinstance(raw_result, dict):
                     sections = raw_result.get("sections", {})
-                    profile_text = sections.get("main_profile", "") + "\n" + sections.get("contact_info", "")
+                    parts = []
+                    for section_name, section_text in sections.items():
+                        if isinstance(section_text, str) and section_text.strip():
+                            parts.append(f"--- {section_name} ---\n{section_text}")
+                    profile_text = "\n\n".join(parts)
+
                 elif hasattr(raw_result, "content") and isinstance(raw_result.content, list):
-                    # For MCP SDK TextContent
+                    # MCP SDK TextContent format
                     for item in raw_result.content:
                         if getattr(item, "type", "") == "text":
                             try:
                                 parsed = json.loads(item.text)
                                 sections = parsed.get("sections", {})
-                                profile_text += sections.get("main_profile", "") + "\n" + sections.get("contact_info", "")
+                                parts = []
+                                for section_name, section_text in sections.items():
+                                    if isinstance(section_text, str) and section_text.strip():
+                                        parts.append(f"--- {section_name} ---\n{section_text}")
+                                profile_text = "\n\n".join(parts)
                             except Exception:
                                 profile_text += item.text + "\n"
                 else:
+                    # Last resort: try parsing as JSON string
                     try:
                         parsed = json.loads(str(raw_result))
                         sections = parsed.get("sections", {})
-                        profile_text = sections.get("main_profile", "") + "\n" + sections.get("contact_info", "")
+                        parts = []
+                        for section_name, section_text in sections.items():
+                            if isinstance(section_text, str) and section_text.strip():
+                                parts.append(f"--- {section_name} ---\n{section_text}")
+                        profile_text = "\n\n".join(parts)
                     except Exception:
                         profile_text = str(raw_result)
 
+            except Exception as e:
+                logger.warning(f"  ⚠️ Direct MCP call failed for {username}: {e}")
+                # Fallback: try via the Agno agent
+                try:
+                    profile_response = await agent.arun(
+                        f'Get the LinkedIn profile for username "{username}". '
+                        f'Call get_person_profile with linkedin_username="{username}", '
+                        f'sections="contact_info,experience,skills". '
+                        f'Then briefly describe what you found.'
+                    )
+                    if hasattr(profile_response, 'content') and profile_response.content:
+                        profile_text = profile_response.content if isinstance(profile_response.content, str) else str(profile_response.content)
+                except Exception as agent_err:
+                    logger.error(f"  ❌ Agent fallback also failed for {username}: {agent_err}")
+
             linkedin_url = f"https://www.linkedin.com/in/{username}/"
-            profile = _parse_profile_from_text(profile_text, linkedin_url)
+            profile = await parse_profile_with_llm(profile_text, linkedin_url)
 
             if not profile.name or profile.name.startswith("Here") or profile.name.startswith("I "):
                 profile.name = username.replace("-", " ").title()

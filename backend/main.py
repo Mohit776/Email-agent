@@ -16,8 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from config import KEYWORDS, GROQ_API_KEY, LINKEDIN_MCP_URL
-from models import SearchResponse
+from models import BriefResult, ProfileResult, SearchResponse
 from agent import run_full_search
+from brief_agent import generate_brief
 
 # --- Logging ---
 logging.basicConfig(
@@ -54,6 +55,138 @@ search_state = {
     "latest_result": None,
 }
 
+# --- Mock profiles DB (for testing without LinkedIn MCP) ---
+MOCK_PROFILES: list[ProfileResult] = [
+    ProfileResult(
+        name="Sophia Reeves",
+        headline="Head of SEO & Organic Growth · Casino & Sports Betting",
+        location="Sliema, Malta",
+        current_company="BetCore Group",
+        linkedin_url="https://www.linkedin.com/in/sophia-reeves-seo/",
+        email="s.reeves@betcore.com",
+        skills=["Technical SEO", "Content Strategy", "Link Building", "GA4", "Ahrefs"],
+        experience_summary="8 years in iGaming SEO. Previously at LeoVegas and 888 Holdings.",
+    ),
+    ProfileResult(
+        name="Marco Dimitriou",
+        headline="Affiliate Program Manager | iGaming | CPA & RevShare Networks",
+        location="Nicosia, Cyprus",
+        current_company="SpinWin Media",
+        linkedin_url="https://www.linkedin.com/in/marco-dimitriou-affiliates/",
+        email="marco.d@spinwinmedia.io",
+        skills=["Affiliate Marketing", "Revenue Share", "Partner Management", "Tracking Platforms"],
+        experience_summary="6 years managing affiliate networks for online casino brands across EU markets.",
+    ),
+    ProfileResult(
+        name="Aisha Ndungu",
+        headline="iGaming Growth Lead | User Acquisition | Africa & LATAM Markets",
+        location="Nairobi, Kenya",
+        current_company="FairPlay Digital",
+        linkedin_url="https://www.linkedin.com/in/aisha-ndungu-growth/",
+        email="",
+        phone="+254 700 123456",
+        skills=["Growth Hacking", "Paid Media", "SEO", "Localisation", "Analytics"],
+        experience_summary="Scaling FairPlay across 12 African countries. Previously growth lead at Betway Africa.",
+    ),
+    ProfileResult(
+        name="Liam Hartley",
+        headline="Gambling SEO Manager | Content & Technical SEO for Tier-1 Casino Brands",
+        location="Dublin, Ireland",
+        current_company="Rank Group Digital",
+        linkedin_url="https://www.linkedin.com/in/liam-hartley-gambling-seo/",
+        email="liam.hartley@rankgroup.ie",
+        skills=["Gambling SEO", "Core Web Vitals", "Schema Markup", "Surfer SEO", "Python"],
+        experience_summary="5 years focused on regulated gambling SEO in UK/IE. Expert in E-E-A-T compliance.",
+    ),
+    ProfileResult(
+        name="Elena Popescu",
+        headline="VP Marketing | Online Casino | CRM & Retention Specialist",
+        location="Bucharest, Romania",
+        current_company="AceCasino.ro",
+        linkedin_url="https://www.linkedin.com/in/elena-popescu-casino/",
+        email="e.popescu@acecasino.ro",
+        skills=["CRM", "Email Marketing", "Retention", "Bonus Strategy", "SEO"],
+        experience_summary="10 years in online gaming marketing. Strong focus on player LTV and retention loops.",
+    ),
+]
+
+
+
+# ── New endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/api/brief", response_model=BriefResult)
+async def get_brief(profile: ProfileResult):
+    """
+    Generate an AI mini-brief for a single LinkedIn profile.
+    Calls Groq LLM and returns a structured BriefResult.
+    """
+    return await generate_brief(profile)
+
+
+@app.post("/api/briefs/batch", response_model=list[BriefResult])
+async def get_briefs_batch(profiles: list[ProfileResult]):
+    """
+    Generate AI briefs for multiple profiles concurrently.
+    Returns a list of BriefResult in the same order as the input.
+    """
+    import asyncio
+    tasks = [generate_brief(p) for p in profiles]
+    results = await asyncio.gather(*tasks)
+    return list(results)
+
+
+@app.get("/api/mock-profiles", response_model=list[ProfileResult])
+async def get_mock_profiles():
+    """
+    Return the in-memory seed profiles for testing without LinkedIn MCP.
+    """
+    return MOCK_PROFILES
+
+
+@app.get("/api/debug/raw-profile/{username}")
+async def debug_raw_profile(username: str):
+    """
+    Debug endpoint: returns the RAW MCP response for a LinkedIn username.
+    Shows exactly what sections LinkedIn returns (contact_info, experience, etc.)
+    Useful for diagnosing missing contact info.
+    """
+    from agno.tools.mcp import MCPTools
+
+    mcp_tools = MCPTools(
+        transport="streamable-http",
+        url=LINKEDIN_MCP_URL,
+        timeout_seconds=60,
+    )
+    try:
+        await mcp_tools.connect()
+        raw_result = await mcp_tools.session.call_tool(
+            "get_person_profile",
+            {"linkedin_username": username, "sections": "contact_info,experience,skills"},
+        )
+
+        # Normalise the raw result into something JSON-serialisable
+        if isinstance(raw_result, dict):
+            return {"source": "dict", "data": raw_result}
+        elif hasattr(raw_result, "content"):
+            import json as _json
+            items = []
+            for item in raw_result.content:
+                if getattr(item, "type", "") == "text":
+                    try:
+                        items.append({"type": "text", "parsed": _json.loads(item.text)})
+                    except Exception:
+                        items.append({"type": "text", "raw": item.text[:2000]})
+            return {"source": "TextContent", "items": items}
+        else:
+            return {"source": "other", "raw": str(raw_result)[:3000]}
+    finally:
+        try:
+            await mcp_tools.close()
+        except Exception:
+            pass
+
+
+# ── Existing endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health_check():

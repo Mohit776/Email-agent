@@ -17,6 +17,16 @@ interface ProfileResult {
   skills: string[];
 }
 
+interface BriefResult {
+  who_they_are: string;
+  what_company_does: string;
+  why_approach: string;
+  likely_pain_point: string;
+  best_outreach_angle: string;
+  suggested_service: string;
+  generated: boolean;
+}
+
 interface KeywordSearchResult {
   keyword: string;
   profiles: ProfileResult[];
@@ -39,42 +49,25 @@ interface SearchStatus {
   has_results: boolean;
 }
 
+type ProfileWithKeyword = ProfileResult & { _keyword: string };
+
 const API_BASE = "http://localhost:8080";
 
 // --- Helper: CSV Export ---
 function exportToCSV(results: KeywordSearchResult[]) {
   const headers = [
-    "Keyword",
-    "Name",
-    "Headline",
-    "Location",
-    "Company",
-    "Email",
-    "Phone",
-    "LinkedIn URL",
-    "Websites",
-    "Skills",
+    "Keyword", "Name", "Headline", "Location", "Company", "Email",
+    "Phone", "LinkedIn URL", "Websites", "Skills",
   ];
-
   const rows = results.flatMap((r) =>
     r.profiles.map((p) => [
-      r.keyword,
-      p.name,
-      p.headline,
-      p.location,
-      p.current_company,
-      p.email,
-      p.phone,
-      p.linkedin_url,
-      p.websites.join("; "),
-      p.skills.join("; "),
+      r.keyword, p.name, p.headline, p.location, p.current_company,
+      p.email, p.phone, p.linkedin_url, p.websites.join("; "), p.skills.join("; "),
     ])
   );
-
   const csv = [headers, ...rows]
     .map((row) => row.map((cell) => `"${(cell || "").replace(/"/g, '""')}"`).join(","))
     .join("\n");
-
   const blob = new Blob([csv], { type: "text/csv" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -88,15 +81,53 @@ function exportToCSV(results: KeywordSearchResult[]) {
 function SkeletonRow() {
   return (
     <tr>
-      {Array.from({ length: 7 }).map((_, i) => (
+      {Array.from({ length: 8 }).map((_, i) => (
         <td key={i} className="p-4">
-          <div className="skeleton h-4 w-full" style={{ width: `${60 + Math.random() * 40}%` }} />
+          <div className="skeleton h-4" style={{ width: `${55 + Math.random() * 45}%` }} />
         </td>
       ))}
     </tr>
   );
 }
 
+// --- Brief Card ---
+function BriefCard({ brief, loading }: { brief?: BriefResult; loading?: boolean }) {
+  if (loading) {
+    return (
+      <div className="brief-card brief-loading">
+        <div className="brief-spinner" />
+        <span className="text-zinc-500 text-xs ml-2">Generating brief…</span>
+      </div>
+    );
+  }
+  if (!brief || !brief.generated) {
+    return <span className="text-zinc-600 text-xs">—</span>;
+  }
+
+  const fields: { label: string; icon: string; value: string; color: string }[] = [
+    { label: "Who They Are", icon: "👤", value: brief.who_they_are, color: "#a78bfa" },
+    { label: "Company", icon: "🏢", value: brief.what_company_does, color: "#06b6d4" },
+    { label: "Why Approach", icon: "🎯", value: brief.why_approach, color: "#34d399" },
+    { label: "Pain Point", icon: "⚡", value: brief.likely_pain_point, color: "#f59e0b" },
+    { label: "Outreach Angle", icon: "📨", value: brief.best_outreach_angle, color: "#f472b6" },
+    { label: "Lead With", icon: "🚀", value: brief.suggested_service, color: "#818cf8" },
+  ];
+
+  return (
+    <div className="brief-card">
+      {fields.map(({ label, icon, value, color }) => (
+        <div key={label} className="brief-field">
+          <span className="brief-label" style={{ color }}>
+            {icon} {label}
+          </span>
+          <p className="brief-value">{value}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// --- Main Component ---
 export default function Home() {
   const [searchData, setSearchData] = useState<SearchResponse | null>(null);
   const [status, setStatus] = useState<SearchStatus | null>(null);
@@ -104,6 +135,9 @@ export default function Home() {
   const [activeKeyword, setActiveKeyword] = useState<string>("all");
   const [error, setError] = useState<string | null>(null);
   const [healthOk, setHealthOk] = useState<boolean | null>(null);
+  const [briefs, setBriefs] = useState<Record<string, BriefResult>>({});
+  const [briefsLoading, setBriefsLoading] = useState<Record<string, boolean>>({});
+  const [loadingTestProfiles, setLoadingTestProfiles] = useState(false);
 
   // Health check on mount
   useEffect(() => {
@@ -113,103 +147,155 @@ export default function Home() {
       .catch(() => setHealthOk(false));
   }, []);
 
+  // Auto-generate briefs whenever profiles change
+  const generateBriefsForProfiles = useCallback(async (profiles: ProfileWithKeyword[]) => {
+    if (profiles.length === 0) return;
+
+    // Mark all as loading
+    const loadingMap: Record<string, boolean> = {};
+    profiles.forEach((p) => {
+      const key = p.linkedin_url || p.name;
+      loadingMap[key] = true;
+    });
+    setBriefsLoading((prev) => ({ ...prev, ...loadingMap }));
+
+    // Fire all requests concurrently via batch endpoint
+    try {
+      const res = await fetch(`${API_BASE}/api/briefs/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(profiles),
+      });
+      if (!res.ok) throw new Error("Batch brief request failed");
+      const data: BriefResult[] = await res.json();
+
+      const newBriefs: Record<string, BriefResult> = {};
+      const doneLoading: Record<string, boolean> = {};
+      profiles.forEach((p, i) => {
+        const key = p.linkedin_url || p.name;
+        newBriefs[key] = data[i];
+        doneLoading[key] = false;
+      });
+
+      setBriefs((prev) => ({ ...prev, ...newBriefs }));
+      setBriefsLoading((prev) => ({ ...prev, ...doneLoading }));
+    } catch (e) {
+      // Fallback: call one-by-one
+      for (const p of profiles) {
+        const key = p.linkedin_url || p.name;
+        try {
+          const res = await fetch(`${API_BASE}/api/brief`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(p),
+          });
+          const brief: BriefResult = await res.json();
+          setBriefs((prev) => ({ ...prev, [key]: brief }));
+        } catch {
+          // silent
+        } finally {
+          setBriefsLoading((prev) => ({ ...prev, [key]: false }));
+        }
+      }
+    }
+  }, []);
+
   // Poll status while searching
   useEffect(() => {
     if (!isSearching) return;
-
     const interval = setInterval(async () => {
       try {
         const res = await fetch(`${API_BASE}/api/search/status`);
         const data: SearchStatus = await res.json();
         setStatus(data);
-
         if (!data.is_running && data.has_results) {
-          // Search completed, fetch results
           const resultRes = await fetch(`${API_BASE}/api/search/results`);
           const resultData: SearchResponse = await resultRes.json();
           setSearchData(resultData);
           setIsSearching(false);
         } else if (!data.is_running && !data.has_results) {
-          // Search failed
           setIsSearching(false);
           setError("Search completed without results. Check backend logs.");
         }
-      } catch {
-        // Backend might be busy, keep polling
-      }
+      } catch { /* keep polling */ }
     }, 2000);
-
     return () => clearInterval(interval);
   }, [isSearching]);
+
+  // Trigger brief generation when search data loads
+  useEffect(() => {
+    if (!searchData) return;
+    const all = searchData.results.flatMap((r) =>
+      r.profiles.map((p) => ({ ...p, _keyword: r.keyword }))
+    );
+    generateBriefsForProfiles(all);
+  }, [searchData, generateBriefsForProfiles]);
 
   const startSearch = useCallback(async () => {
     setError(null);
     setSearchData(null);
+    setBriefs({});
+    setBriefsLoading({});
     setIsSearching(true);
     setActiveKeyword("all");
-
     try {
       const res = await fetch(`${API_BASE}/api/search`, { method: "POST" });
       const data = await res.json();
-
       if (!res.ok) {
         setError(data.error || "Failed to start search");
         setIsSearching(false);
       }
-    } catch (e) {
+    } catch {
       setError("Cannot connect to backend. Is FastAPI running on port 8080?");
       setIsSearching(false);
     }
   }, []);
 
-  // Filter profiles by keyword
+  const loadTestProfiles = useCallback(async () => {
+    setLoadingTestProfiles(true);
+    setBriefs({});
+    setBriefsLoading({});
+    try {
+      const res = await fetch(`${API_BASE}/api/mock-profiles`);
+      const profiles: ProfileResult[] = await res.json();
+      const fakeResult: SearchResponse = {
+        results: [{ keyword: "mock-data", profiles, count: profiles.length }],
+        total_profiles: profiles.length,
+        search_duration_seconds: 0,
+        status: "completed",
+        error: null,
+      };
+      setSearchData(fakeResult);
+      setActiveKeyword("all");
+    } catch {
+      setError("Failed to load test profiles from backend.");
+    } finally {
+      setLoadingTestProfiles(false);
+    }
+  }, []);
+
   const filteredResults =
     activeKeyword === "all"
       ? searchData?.results || []
       : searchData?.results.filter((r) => r.keyword === activeKeyword) || [];
 
-  const allProfiles = filteredResults.flatMap((r) =>
+  const allProfiles: ProfileWithKeyword[] = filteredResults.flatMap((r) =>
     r.profiles.map((p) => ({ ...p, _keyword: r.keyword }))
+  );
+
+  const briefsGenerating = Object.values(briefsLoading).some(Boolean);
+  const briefsDone = allProfiles.length > 0 && allProfiles.every(
+    (p) => briefs[p.linkedin_url || p.name]?.generated
   );
 
   return (
     <div className="relative min-h-screen overflow-hidden">
       {/* Background orbs */}
-      <div
-        className="bg-orb"
-        style={{
-          width: 500,
-          height: 500,
-          background: "var(--accent-purple)",
-          top: "-10%",
-          left: "-5%",
-        }}
-      />
-      <div
-        className="bg-orb"
-        style={{
-          width: 400,
-          height: 400,
-          background: "var(--accent-cyan)",
-          bottom: "-10%",
-          right: "-5%",
-          animationDelay: "7s",
-        }}
-      />
-      <div
-        className="bg-orb"
-        style={{
-          width: 300,
-          height: 300,
-          background: "#6366f1",
-          top: "40%",
-          right: "20%",
-          animationDelay: "14s",
-        }}
-      />
+      <div className="bg-orb" style={{ width: 500, height: 500, background: "var(--accent-purple)", top: "-10%", left: "-5%" }} />
+      <div className="bg-orb" style={{ width: 400, height: 400, background: "var(--accent-cyan)", bottom: "-10%", right: "-5%", animationDelay: "7s" }} />
+      <div className="bg-orb" style={{ width: 300, height: 300, background: "#6366f1", top: "40%", right: "20%", animationDelay: "14s" }} />
 
-      {/* Main content */}
-      <div className="relative z-10 w-full max-w-[1440px] mx-auto px-6 py-10">
+      <div className="relative z-10 w-full max-w-[1600px] mx-auto px-6 py-10">
         {/* Header */}
         <header className="text-center mb-12 fade-in-up">
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-purple-500/20 bg-purple-500/5 mb-6">
@@ -223,8 +309,7 @@ export default function Home() {
             <span className="text-white">Profile Finder</span>
           </h1>
           <p className="text-lg text-zinc-400 max-w-2xl mx-auto">
-            Discover iGaming industry professionals across SEO, marketing, affiliates, and more.
-            AI-powered search with structured contact data.
+            Discover iGaming professionals with AI-generated outreach briefs — instantly.
           </p>
         </header>
 
@@ -240,12 +325,7 @@ export default function Home() {
               <>
                 <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
                   <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
-                  <path
-                    d="M4 12a8 8 0 018-8"
-                    stroke="currentColor"
-                    strokeWidth="3"
-                    strokeLinecap="round"
-                  />
+                  <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                 </svg>
                 Searching...
               </>
@@ -260,39 +340,52 @@ export default function Home() {
             )}
           </button>
 
+          {/* Load Test Profiles */}
+          <button
+            id="load-test-btn"
+            onClick={loadTestProfiles}
+            disabled={loadingTestProfiles || isSearching}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl border border-cyan-500/30 bg-cyan-500/5 text-cyan-400 text-sm font-medium hover:bg-cyan-500/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {loadingTestProfiles ? (
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
+                <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+              </svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2a10 10 0 1 0 10 10" />
+                <path d="M12 8v4l3 3" />
+              </svg>
+            )}
+            Load Test Profiles
+          </button>
+
           {/* Status */}
           <div className="flex-1 text-sm text-zinc-400">
             {healthOk === false && (
-              <span className="text-red-400">
-                ⚠ Backend not connected. Start FastAPI on port 8080.
-              </span>
+              <span className="text-red-400">⚠ Backend not connected. Start FastAPI on port 8080.</span>
             )}
             {healthOk === true && !isSearching && !searchData && (
-              <span>Ready — 8 iGaming keywords loaded</span>
+              <span>Ready — Click "Start Search" or "Load Test Profiles"</span>
             )}
             {isSearching && status && (
               <div className="space-y-2">
                 <span>
                   Searching:{" "}
-                  <span className="text-purple-300 font-medium">
-                    {status.current_keyword || "initializing..."}
-                  </span>{" "}
+                  <span className="text-purple-300 font-medium">{status.current_keyword || "initializing..."}</span>{" "}
                   ({status.progress + 1}/{status.total || 8})
                 </span>
                 <div className="progress-bar max-w-xs">
-                  <div
-                    className="progress-bar-fill"
-                    style={{
-                      width: `${status.total ? ((status.progress + 1) / status.total) * 100 : 10}%`,
-                    }}
-                  />
+                  <div className="progress-bar-fill" style={{ width: `${status.total ? ((status.progress + 1) / status.total) * 100 : 10}%` }} />
                 </div>
               </div>
             )}
             {searchData && !isSearching && (
-              <span className="text-green-400">
-                ✓ Found {searchData.total_profiles} profiles in{" "}
-                {searchData.search_duration_seconds.toFixed(1)}s
+              <span className={briefsDone ? "text-green-400" : briefsGenerating ? "text-yellow-400" : "text-green-400"}>
+                {briefsGenerating
+                  ? `✦ ${searchData.total_profiles} profiles found — generating AI briefs…`
+                  : `✓ ${searchData.total_profiles} profiles · AI briefs ready`}
               </span>
             )}
           </div>
@@ -352,29 +445,28 @@ export default function Home() {
             <table className="profile-table">
               <thead>
                 <tr>
-                  <th>#</th>
-                  <th>Name</th>
-                  <th>Headline</th>
-                  <th>Location</th>
-                  <th>Company</th>
-                  <th>Contact</th>
-                  <th>LinkedIn</th>
+                  <th style={{ minWidth: 40 }}>#</th>
+                  <th style={{ minWidth: 160 }}>Name</th>
+                  <th style={{ minWidth: 200 }}>Headline</th>
+                  <th style={{ minWidth: 130 }}>Location</th>
+                  <th style={{ minWidth: 130 }}>Company</th>
+                  <th style={{ minWidth: 180 }}>Contact</th>
+                  <th style={{ minWidth: 90 }}>LinkedIn</th>
+                  <th style={{ minWidth: 380 }}>
+                    <span className="gradient-text">✦ AI Brief</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
                 {/* Loading state */}
                 {isSearching && allProfiles.length === 0 && (
-                  <>
-                    {Array.from({ length: 6 }).map((_, i) => (
-                      <SkeletonRow key={i} />
-                    ))}
-                  </>
+                  <>{Array.from({ length: 6 }).map((_, i) => <SkeletonRow key={i} />)}</>
                 )}
 
                 {/* Empty state */}
                 {!isSearching && allProfiles.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="text-center py-20 text-zinc-500">
+                    <td colSpan={8} className="text-center py-20 text-zinc-500">
                       <div className="flex flex-col items-center gap-3">
                         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-zinc-600">
                           <circle cx="11" cy="11" r="8" />
@@ -382,7 +474,7 @@ export default function Home() {
                         </svg>
                         <p className="text-base">No profiles yet</p>
                         <p className="text-sm text-zinc-600">
-                          Click &quot;Start Search&quot; to discover iGaming professionals
+                          Click &quot;Start Search&quot; or &quot;Load Test Profiles&quot; to see AI briefs
                         </p>
                       </div>
                     </td>
@@ -390,63 +482,80 @@ export default function Home() {
                 )}
 
                 {/* Profile rows */}
-                {allProfiles.map((profile, index) => (
-                  <tr key={`${profile.linkedin_url}-${index}`}>
-                    <td className="text-zinc-500 font-mono text-xs">
-                      {index + 1}
-                    </td>
-                    <td>
-                      <div className="font-medium text-white">{profile.name}</div>
-                      {activeKeyword === "all" && (
-                        <span className="text-[10px] text-purple-400 font-medium uppercase tracking-wide">
-                          {(profile as ProfileResult & { _keyword: string })._keyword}
+                {allProfiles.map((profile, index) => {
+                  const key = profile.linkedin_url || profile.name;
+                  const brief = briefs[key];
+                  const loading = briefsLoading[key];
+                  return (
+                    <tr key={`${key}-${index}`} className="profile-row-with-brief">
+                      <td className="text-zinc-500 font-mono text-xs">{index + 1}</td>
+                      <td>
+                        <div className="font-medium text-white">{profile.name}</div>
+                        {activeKeyword === "all" && (
+                          <span className="text-[10px] text-purple-400 font-medium uppercase tracking-wide">
+                            {profile._keyword}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ maxWidth: 220 }}>
+                        <span className="text-zinc-300 line-clamp-2 text-[13px]">
+                          {profile.headline || "—"}
                         </span>
-                      )}
-                    </td>
-                    <td className="max-w-[240px]">
-                      <span className="text-zinc-300 line-clamp-2 text-[13px]">
-                        {profile.headline || "—"}
-                      </span>
-                    </td>
-                    <td className="text-zinc-400 text-[13px]">{profile.location || "—"}</td>
-                    <td className="text-zinc-300 text-[13px]">{profile.current_company || "—"}</td>
-                    <td>
-                      <div className="flex flex-col gap-1 text-[13px]">
-                        {profile.email && (
-                          <a
-                            href={`mailto:${profile.email}`}
-                            className="text-cyan-400 hover:text-cyan-300 transition-colors"
-                          >
-                            ✉ {profile.email}
+                      </td>
+                      <td className="text-zinc-400 text-[13px]">{profile.location || "—"}</td>
+                      <td className="text-zinc-300 text-[13px]">{profile.current_company || "—"}</td>
+                      <td>
+                        <div className="flex flex-col gap-1 text-[13px]">
+                          {profile.email && (
+                            <a href={`mailto:${profile.email}`} className="text-cyan-400 hover:text-cyan-300 transition-colors flex items-center gap-1">
+                              <span>✉</span> {profile.email}
+                            </a>
+                          )}
+                          {profile.phone && (
+                            <span className="text-zinc-400 flex items-center gap-1">
+                              <span>📞</span> {profile.phone}
+                            </span>
+                          )}
+                          {profile.websites && profile.websites.length > 0 && (
+                            <div className="flex flex-col gap-0.5">
+                              {profile.websites.slice(0, 2).map((url, i) => (
+                                <a
+                                  key={i}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-purple-400 hover:text-purple-300 transition-colors text-[11px] truncate max-w-[160px]"
+                                >
+                                  🔗 {url.replace(/^https?:\/\//, "").replace(/\/$/, "")}
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                          {!profile.email && !profile.phone && (!profile.websites || profile.websites.length === 0) && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-zinc-800/80 text-zinc-500 border border-zinc-700/50">
+                              🔒 LinkedIn only
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td>
+                        {profile.linkedin_url ? (
+                          <a href={profile.linkedin_url} target="_blank" rel="noopener noreferrer" className="linkedin-link text-[13px] inline-flex items-center gap-1">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                              <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
+                            </svg>
+                            Profile
                           </a>
-                        )}
-                        {profile.phone && (
-                          <span className="text-zinc-400">📞 {profile.phone}</span>
-                        )}
-                        {!profile.email && !profile.phone && (
+                        ) : (
                           <span className="text-zinc-600">—</span>
                         )}
-                      </div>
-                    </td>
-                    <td>
-                      {profile.linkedin_url ? (
-                        <a
-                          href={profile.linkedin_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="linkedin-link text-[13px] inline-flex items-center gap-1"
-                        >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
-                          </svg>
-                          Profile
-                        </a>
-                      ) : (
-                        <span className="text-zinc-600">—</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                      </td>
+                      <td>
+                        <BriefCard brief={brief} loading={loading} />
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -457,6 +566,59 @@ export default function Home() {
           <p>LinkedIn AI Profile Finder — POC · Agno + Groq + LinkedIn MCP</p>
         </footer>
       </div>
+
+      {/* Brief card styles */}
+      <style>{`
+        .brief-card {
+          background: rgba(139, 92, 246, 0.06);
+          border: 1px solid rgba(139, 92, 246, 0.15);
+          border-radius: 12px;
+          padding: 10px 12px;
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+          min-width: 340px;
+          max-width: 420px;
+        }
+        .brief-loading {
+          display: flex;
+          align-items: center;
+          padding: 12px;
+          background: rgba(139, 92, 246, 0.04);
+        }
+        .brief-spinner {
+          width: 14px;
+          height: 14px;
+          border: 2px solid rgba(139, 92, 246, 0.2);
+          border-top-color: #8b5cf6;
+          border-radius: 50%;
+          animation: spin 0.8s linear infinite;
+          flex-shrink: 0;
+        }
+        .brief-field {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .brief-label {
+          font-size: 10px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.07em;
+          opacity: 0.9;
+        }
+        .brief-value {
+          font-size: 12px;
+          color: #d4d4d8;
+          line-height: 1.5;
+          margin: 0;
+        }
+        .profile-row-with-brief td {
+          vertical-align: top;
+          padding-top: 16px;
+          padding-bottom: 16px;
+        }
+      `}</style>
     </div>
   );
 }

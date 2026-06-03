@@ -20,6 +20,17 @@ class ProfileResult(BaseModel):
     skills: list[str] = []
 
 
+class BriefResult(BaseModel):
+    """AI-generated mini brief about a LinkedIn profile."""
+    who_they_are: str = ""
+    what_company_does: str = ""
+    why_approach: str = ""
+    likely_pain_point: str = ""
+    best_outreach_angle: str = ""
+    suggested_service: str = ""
+    generated: bool = False
+
+
 class KeywordSearchResult(BaseModel):
     """Results for a single keyword search."""
     keyword: str
