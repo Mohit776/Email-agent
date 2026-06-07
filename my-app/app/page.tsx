@@ -49,6 +49,20 @@ interface SearchStatus {
   has_results: boolean;
 }
 
+interface EmailSendResult {
+  name: string;
+  email: string;
+  status: "sent" | "skipped" | "failed";
+  reason: string;
+}
+
+interface SendEmailsResponse {
+  sent: number;
+  skipped: number;
+  failed: number;
+  results: EmailSendResult[];
+}
+
 type ProfileWithKeyword = ProfileResult & { _keyword: string };
 
 const API_BASE = "http://localhost:8080";
@@ -138,6 +152,12 @@ export default function Home() {
   const [briefs, setBriefs] = useState<Record<string, BriefResult>>({});
   const [briefsLoading, setBriefsLoading] = useState<Record<string, boolean>>({});
   const [loadingTestProfiles, setLoadingTestProfiles] = useState(false);
+
+  // Email state
+  const [showResultsModal, setShowResultsModal] = useState(false);
+  const [sendingEmails, setSendingEmails] = useState(false);
+  const [emailProgress, setEmailProgress] = useState<{ current: number; total: number; currentName: string } | null>(null);
+  const [emailResults, setEmailResults] = useState<SendEmailsResponse | null>(null);
 
   // Health check on mount
   useEffect(() => {
@@ -236,6 +256,7 @@ export default function Home() {
     setSearchData(null);
     setBriefs({});
     setBriefsLoading({});
+    setEmailResults(null);
     setIsSearching(true);
     setActiveKeyword("all");
     try {
@@ -287,6 +308,60 @@ export default function Home() {
   const briefsDone = allProfiles.length > 0 && allProfiles.every(
     (p) => briefs[p.linkedin_url || p.name]?.generated
   );
+
+  const profilesWithEmail = allProfiles.filter((p) => p.email);
+
+  const sendEmails = useCallback(async () => {
+    setSendingEmails(true);
+    const recipients = allProfiles.map((p) => ({
+      profile: p,
+      brief: briefs[p.linkedin_url || p.name] || null,
+    }));
+
+    const finalResults: SendEmailsResponse = {
+      sent: 0,
+      skipped: 0,
+      failed: 0,
+      results: [],
+    };
+
+    setEmailProgress({ current: 0, total: recipients.length, currentName: "" });
+    setEmailResults(finalResults);
+    setShowResultsModal(true);
+
+    for (let i = 0; i < recipients.length; i++) {
+      const r = recipients[i];
+      setEmailProgress({ current: i + 1, total: recipients.length, currentName: r.profile.name });
+
+      try {
+        const res = await fetch(`${API_BASE}/api/send-emails`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ recipients: [r] }),
+        });
+        const data: SendEmailsResponse = await res.json();
+        
+        finalResults.sent += data.sent || 0;
+        finalResults.skipped += data.skipped || 0;
+        finalResults.failed += data.failed || 0;
+        if (data.results) finalResults.results.push(...data.results);
+
+        setEmailResults({ ...finalResults });
+      } catch {
+        finalResults.failed += 1;
+        finalResults.results.push({
+          name: r.profile.name,
+          email: r.profile.email || "",
+          status: "failed",
+          reason: "Network error",
+        });
+        setEmailResults({ ...finalResults });
+      }
+    }
+
+    setEmailProgress(null);
+    setSendingEmails(false);
+  }, [allProfiles, briefs]);
 
   return (
     <div className="relative min-h-screen overflow-hidden">
@@ -403,6 +478,34 @@ export default function Home() {
                 <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
               Export CSV
+            </button>
+          )}
+
+          {/* Send Emails */}
+          {allProfiles.length > 0 && (
+            <button
+              id="send-emails-btn"
+              onClick={sendEmails}
+              disabled={sendingEmails}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 text-emerald-400 text-sm font-medium hover:bg-emerald-500/15 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {sendingEmails ? (
+                <>
+                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
+                    <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
+                  Sending…
+                </>
+              ) : (
+                <>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 2 11 13" />
+                    <path d="m22 2-7 20-4-9-9-4 20-7z" />
+                  </svg>
+                  Send Emails{profilesWithEmail.length > 0 ? ` (${profilesWithEmail.length})` : ""}
+                </>
+              )}
             </button>
           )}
         </div>
@@ -567,7 +670,81 @@ export default function Home() {
         </footer>
       </div>
 
-      {/* Brief card styles */}
+      {/* ── Email Results Modal ── */}
+      {showResultsModal && emailResults && (
+        <div className="modal-overlay" onClick={() => !sendingEmails && setShowResultsModal(false)}>
+          <div className="modal-box modal-box-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-icon">{sendingEmails ? "⏳" : "✅"}</div>
+              <div>
+                <h2 className="modal-title">{sendingEmails ? "Sending Emails..." : "Emails Sent"}</h2>
+                <p className="modal-subtitle">
+                  {sendingEmails && emailProgress
+                    ? `Sending ${emailProgress.current} of ${emailProgress.total} (Currently: ${emailProgress.currentName})`
+                    : "Campaign complete — here's your delivery report."}
+                </p>
+              </div>
+            </div>
+
+            <div className="modal-stats" style={{ margin: "0 0 16px" }}>
+              <div className="modal-stat">
+                <span className="modal-stat-value text-emerald-400">{emailResults.sent}</span>
+                <span className="modal-stat-label">sent</span>
+              </div>
+              <div className="modal-stat">
+                <span className="modal-stat-value text-yellow-400">{emailResults.skipped}</span>
+                <span className="modal-stat-label">skipped</span>
+              </div>
+              <div className="modal-stat">
+                <span className="modal-stat-value text-red-400">{emailResults.failed}</span>
+                <span className="modal-stat-label">failed</span>
+              </div>
+            </div>
+
+            <div className="results-list">
+              {emailResults.results.map((r, i) => (
+                <div key={i} className={`result-row result-row-${r.status}`}>
+                  <span className="result-icon">
+                    {r.status === "sent" ? "✅" : r.status === "skipped" ? "⚠️" : "❌"}
+                  </span>
+                  <div className="result-info">
+                    <span className="result-name">{r.name}</span>
+                    <span className="result-email">{r.email || "—"}</span>
+                    {r.reason && <span className="result-reason">{r.reason}</span>}
+                  </div>
+                  <span className={`result-badge result-badge-${r.status}`}>{r.status}</span>
+                </div>
+              ))}
+              {sendingEmails && (
+                <div className="result-row" style={{ opacity: 0.6, borderStyle: "dashed" }}>
+                   <span className="result-icon">
+                     <svg className="animate-spin h-4 w-4 text-purple-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
+                        <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                        <path d="M4 12a8 8 0 018-8" strokeLinecap="round" />
+                     </svg>
+                   </span>
+                   <div className="result-info">
+                     <span className="result-name">{emailProgress?.currentName || "..."}</span>
+                     <span className="result-email">Sending...</span>
+                   </div>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <button 
+                className="modal-confirm" 
+                onClick={() => setShowResultsModal(false)}
+                disabled={sendingEmails}
+              >
+                {sendingEmails ? "Sending..." : "Done"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Brief card styles + modal styles */}
       <style>{`
         .brief-card {
           background: rgba(139, 92, 246, 0.06);
@@ -618,6 +795,158 @@ export default function Home() {
           padding-top: 16px;
           padding-bottom: 16px;
         }
+
+        /* ── Modal Styles ── */
+        .modal-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.7);
+          backdrop-filter: blur(6px);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 9999;
+          padding: 16px;
+          animation: fadeIn 0.15s ease;
+        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .modal-box {
+          background: #111118;
+          border: 1px solid rgba(139, 92, 246, 0.25);
+          border-radius: 20px;
+          padding: 28px;
+          width: 100%;
+          max-width: 480px;
+          animation: slideUp 0.2s ease;
+          box-shadow: 0 30px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(139,92,246,0.1);
+        }
+        .modal-box-wide { max-width: 600px; }
+        @keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        .modal-header {
+          display: flex;
+          align-items: flex-start;
+          gap: 16px;
+          margin-bottom: 24px;
+        }
+        .modal-icon {
+          font-size: 32px;
+          line-height: 1;
+          flex-shrink: 0;
+        }
+        .modal-title {
+          font-size: 20px;
+          font-weight: 700;
+          color: #fff;
+          margin: 0 0 4px;
+        }
+        .modal-subtitle {
+          font-size: 13px;
+          color: #71717a;
+          margin: 0;
+          line-height: 1.5;
+        }
+        .modal-body { display: flex; flex-direction: column; gap: 16px; }
+        .modal-field { display: flex; flex-direction: column; gap: 6px; }
+        .modal-label {
+          font-size: 12px;
+          font-weight: 600;
+          color: #a1a1aa;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+        .modal-input {
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(255,255,255,0.1);
+          border-radius: 10px;
+          padding: 10px 14px;
+          color: #fff;
+          font-size: 14px;
+          outline: none;
+          transition: border-color 0.15s;
+          width: 100%;
+        }
+        .modal-input:focus { border-color: rgba(139,92,246,0.5); }
+        .modal-hint { font-size: 11px; color: #52525b; }
+        .modal-stats {
+          display: flex;
+          gap: 20px;
+          padding: 16px;
+          background: rgba(255,255,255,0.03);
+          border-radius: 12px;
+          border: 1px solid rgba(255,255,255,0.06);
+          margin-top: 8px;
+        }
+        .modal-stat { display: flex; flex-direction: column; align-items: center; gap: 2px; flex: 1; }
+        .modal-stat-value { font-size: 24px; font-weight: 700; }
+        .modal-stat-label { font-size: 11px; color: #71717a; }
+        .modal-footer {
+          display: flex;
+          justify-content: flex-end;
+          gap: 12px;
+          margin-top: 24px;
+        }
+        .modal-cancel {
+          padding: 10px 20px;
+          border-radius: 10px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: transparent;
+          color: #a1a1aa;
+          font-size: 14px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: background 0.15s;
+        }
+        .modal-cancel:hover { background: rgba(255,255,255,0.05); }
+        .modal-confirm {
+          padding: 10px 20px;
+          border-radius: 10px;
+          background: linear-gradient(135deg, #10b981, #059669);
+          color: #fff;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          border: none;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          transition: opacity 0.15s, transform 0.1s;
+        }
+        .modal-confirm:hover:not(:disabled) { opacity: 0.9; transform: translateY(-1px); }
+        .modal-confirm:disabled { opacity: 0.4; cursor: not-allowed; }
+        .results-list {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          max-height: 320px;
+          overflow-y: auto;
+          padding-right: 4px;
+        }
+        .result-row {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 10px 14px;
+          border-radius: 10px;
+          background: rgba(255,255,255,0.03);
+          border: 1px solid rgba(255,255,255,0.06);
+        }
+        .result-icon { font-size: 16px; flex-shrink: 0; }
+        .result-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+        .result-name { font-size: 13px; font-weight: 600; color: #e4e4e7; }
+        .result-email { font-size: 11px; color: #71717a; }
+        .result-reason { font-size: 11px; color: #a1a1aa; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .result-badge {
+          font-size: 10px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.06em;
+          padding: 2px 8px;
+          border-radius: 20px;
+          flex-shrink: 0;
+        }
+        .result-badge-sent { background: rgba(16,185,129,0.15); color: #34d399; }
+        .result-badge-skipped { background: rgba(245,158,11,0.15); color: #fbbf24; }
+        .result-badge-failed { background: rgba(239,68,68,0.15); color: #f87171; }
       `}</style>
     </div>
   );

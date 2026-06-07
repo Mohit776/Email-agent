@@ -15,8 +15,11 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from config import KEYWORDS, GROQ_API_KEY, LINKEDIN_MCP_URL
-from models import BriefResult, ProfileResult, SearchResponse
+from config import KEYWORDS, GROQ_API_KEY, LINKEDIN_MCP_URL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM_NAME
+from models import (
+    BriefResult, ProfileResult, SearchResponse,
+    SendEmailsRequest, SendEmailsResponse, EmailSendResult,
+)
 from agent import run_full_search
 from brief_agent import generate_brief
 
@@ -110,6 +113,114 @@ MOCK_PROFILES: list[ProfileResult] = [
     ),
 ]
 
+
+
+# ── Email outreach endpoint ───────────────────────────────────────────────────
+
+# Hardcoded outreach email template
+_EMAIL_SUBJECT = "Quick question about your SEO strategy"
+
+_EMAIL_BODY_TEMPLATE = """Hi {name},
+
+I came across your profile and was impressed by your work at {company} as {headline}.
+
+We help iGaming and digital brands identify quick-win SEO opportunities — competitor gap analysis, technical audits, and content strategies that drive organic growth.
+
+Would you be open to a 15-minute call this week to see if there's a fit?
+
+Best,
+{from_name}"""
+
+
+def _compose_email(
+    profile: ProfileResult,
+    from_name: str,
+) -> dict[str, str]:
+    """Build a hardcoded outreach email from the profile fields."""
+    body = _EMAIL_BODY_TEMPLATE.format(
+        name=profile.name or "there",
+        company=profile.current_company or "your company",
+        headline=profile.headline or "your role",
+        from_name=from_name,
+    )
+    return {"subject": _EMAIL_SUBJECT, "body": body}
+
+
+def _send_smtp(to_email: str, subject: str, body: str, user: str, password: str, from_name: str):
+    """Send one plain-text email via SMTP TLS."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.utils import formataddr
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = formataddr((from_name, user))
+    msg["To"] = to_email
+    msg.attach(MIMEText(body, "plain"))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(user, password)
+        server.sendmail(user, [to_email], msg.as_string())
+
+
+@app.post("/api/send-emails", response_model=SendEmailsResponse)
+async def send_emails(req: SendEmailsRequest):
+    """
+    Send a hardcoded outreach email to each profile that has an email address.
+    """
+    smtp_user = req.smtp_user or SMTP_USER
+    smtp_pass = req.smtp_pass or SMTP_PASS
+    from_name = req.smtp_from_name or SMTP_FROM_NAME
+
+    if not smtp_user or not smtp_pass:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "SMTP credentials not configured. Set SMTP_USER / SMTP_PASS in .env or pass them in the request."},
+        )
+
+    results: list[EmailSendResult] = []
+    sent = skipped = failed = 0
+
+    for r in req.recipients:
+        profile = r.profile
+        target_email = (r.override_email or profile.email or "").strip()
+
+        if not target_email:
+            results.append(EmailSendResult(
+                name=profile.name, email="", status="skipped", reason="No email address"
+            ))
+            skipped += 1
+            continue
+
+        try:
+            composed = _compose_email(profile, from_name)
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                _send_smtp,
+                target_email,
+                composed["subject"],
+                composed["body"],
+                smtp_user,
+                smtp_pass,
+                from_name,
+            )
+            results.append(EmailSendResult(
+                name=profile.name, email=target_email, status="sent",
+                reason=f"Subject: {composed['subject']}"
+            ))
+            sent += 1
+            logger.info(f"✅ Email sent to {target_email} ({profile.name})")
+        except Exception as e:
+            results.append(EmailSendResult(
+                name=profile.name, email=target_email, status="failed", reason=str(e)
+            ))
+            failed += 1
+            logger.error(f"❌ Failed to send to {target_email}: {e}")
+
+    return SendEmailsResponse(sent=sent, skipped=skipped, failed=failed, results=results)
 
 
 # ── New endpoints ─────────────────────────────────────────────────────────────

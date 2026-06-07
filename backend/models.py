@@ -45,3 +45,39 @@ class SearchResponse(BaseModel):
     search_duration_seconds: float = 0.0
     status: str = "completed"
     error: str | None = None
+
+
+# --- Email outreach models ---
+
+class EmailRecipient(BaseModel):
+    """A single profile + its brief, packaged for emailing."""
+    profile: ProfileResult
+    brief: BriefResult | None = None
+    # Optional override: use this address instead of profile.email
+    override_email: str = ""
+
+
+class SendEmailsRequest(BaseModel):
+    """Request body for POST /api/send-emails."""
+    recipients: list[EmailRecipient]
+    # Sender credentials (overrides .env if provided)
+    smtp_user: str = ""
+    smtp_pass: str = ""
+    smtp_from_name: str = ""
+
+
+class EmailSendResult(BaseModel):
+    """Result for a single recipient."""
+    name: str
+    email: str
+    status: str          # "sent" | "skipped" | "failed"
+    reason: str = ""
+
+
+class SendEmailsResponse(BaseModel):
+    """Response from POST /api/send-emails."""
+    sent: int = 0
+    skipped: int = 0
+    failed: int = 0
+    results: list[EmailSendResult] = []
+
